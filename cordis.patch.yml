@@ -1,0 +1,7 @@
+# dsh-chatlog 的配置层。
+#
+# 注意：这里的 id 必须与 index.js 里的 `export const name` 完全一致
+# （都是 chatlog）。不一致的话插件会静默不生效 —— 这是最容易踩的坑。
+- insert:
+    - id: chatlog
+      name: dsh-chatlog
