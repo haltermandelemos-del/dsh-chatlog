@@ -1,0 +1,29 @@
+{
+  "name": "dsh-chatlog",
+  "version": "0.1.8",
+  "description": "每轮对话结束自动把 DSH 会话写成本地纯文本 .txt，并提供一个手动导出工具。",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "chatlog",
+    "transcript"
+  ],
+  "license": "MIT"
+}
