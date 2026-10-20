@@ -18,6 +18,9 @@ git clone https://github.com/haltermandelemos-del/dsh-chatlog.git
 cd dsh-chatlog
 npm pack                      # 生成 dsh-chatlog-0.1.8.tgz
 
+# 或者不装 git，直接下 Release 里现成的 tgz：
+# https://github.com/haltermandelemos-del/dsh-chatlog/releases
+
 # 装进 DSH 的 profile（web 是默认 profile 名，按自己的改）
 dsh plugin --profile web add ./dsh-chatlog-0.1.8.tgz
 ```
