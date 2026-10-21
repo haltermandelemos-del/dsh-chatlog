@@ -3,6 +3,7 @@
 每轮对话结束，自动把当前 DSH 会话写成本地纯文本 `.txt`；另外提供一个手动导出工具（默认关闭）。
 
 装上就不用管了 —— 聊天过程中什么都不用做，说完一轮，文档自己就在那了。
+文档统一放在“dsh会话”文件夹里。
 
 > A tiny plugin for **DeepSeek Harness (DSH)** that writes every chat session to a
 > plain-text `.txt` file on each `turn/end`, with optional Markdown stripping.
