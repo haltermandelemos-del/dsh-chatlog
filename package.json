@@ -1,6 +1,6 @@
 {
   "name": "dsh-chatlog",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "把 DSH 会话导出成本地纯文本 .txt：活着的在 DshChat，归档/已消失的在 DshChat/DeletedChat。",
   "type": "module",
   "main": "index.js",

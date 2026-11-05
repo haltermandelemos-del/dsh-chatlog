@@ -30,7 +30,7 @@ import { zstdDecompressSync } from 'node:zlib'
 
 export const name = 'chatlog'
 
-const VERSION = '0.4.0'
+const VERSION = '0.4.1'
 const SESSION_ROOT = path.join(homedir(), '.dsh', 'sessions')
 const WORKSPACE_STATE = path.join(homedir(), '.dsh', 'storages', 'workspace.json')
 const DEFAULT_DIR = '/sdcard/dsh/DshChat'
@@ -50,7 +50,7 @@ const OWNER_RE = /^会话[ \t]+(session-\S+)[ \t]*$/m
  * 块头：`\n—— 2026/10/30 22:53:06 · 你 ——`
  * 只用在“把磁盘文档拆回块”的时候；时间格式化固定，误判概率可以忽略。
  */
-const CHUNK_HEAD = /\n—— \d{4}\/\d{2}\/\d{2} \d{2}:\d{2}:\d{2} · [^\n]* ——(?=\n)/g
+const CHUNK_HEAD = /\n\n—— \d{4}\/\d{2}\/\d{2} \d{2}:\d{2}:\d{2} · [^\n]* ——(?=\n)/g
 /** 能进“表面”的事件类型（与 DSH 会话格式一致）。 */
 const SURFACE_TYPES = new Set([
   'system/message', 'developer/message', 'user/message', 'assistant/message', 'tool/result',
@@ -377,7 +377,7 @@ function renderDoc(id, records, opt) {
   }
 
   // 块文本统一以换行开头：这样文档 = 头 + 若干块 + 结尾换行，追加时天然对齐
-  const out = chunks.map(c => '\n' + c.lines.join('\n'))
+  const out = chunks.map(c => '\n\n' + c.lines.join('\n'))
   return { head: L.join('\n'), chunks: out }
 }
 
