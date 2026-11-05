@@ -28,9 +28,8 @@ import { homedir } from 'node:os'
 import { zstdDecompressSync } from 'node:zlib'
 
 export const name = 'chatlog'
-export const inject = ['tools']
 
-const VERSION = '0.1.8'
+const VERSION = '0.2.0'
 const SESSION_ROOT = path.join(homedir(), '.dsh', 'sessions')
 const DEFAULT_DIR = '/sdcard/dsh/dsh会话'
 /** 归档会话的子目录名（放在 dsh会话 里面）。 */
@@ -130,7 +129,12 @@ function candidateFiles() {
       const dir = path.join(projDir, s)
       for (const f of ['session.v4.jsonl.zstd', 'session.v4.jsonl']) {
         const p = path.join(dir, f)
-        try { if (fs.statSync(p).isFile()) { out.push({ id: s, file: p, mtime: fs.statSync(p).mtimeMs }); break } } catch { /* 下一个 */ }
+        // 只 stat 一次：以前 isFile() 和 mtimeMs 各调一次 statSync，
+        // 两次调用之间文件被删的话会抛 ENOENT 被吞掉，整个会话静默消失。
+        try {
+          const st = fs.statSync(p)
+          if (st.isFile()) { out.push({ id: s, file: p, mtime: st.mtimeMs }); break }
+        } catch { /* 下一个 */ }
       }
     }
   }
@@ -145,11 +149,15 @@ function findSessionFile(id) {
 /* ------------------------------------------------------------------ *
  * 渲染成纯文本
  * ------------------------------------------------------------------ */
-/** 时区 -> formatter。原来是每条消息都 new 一个，长会话能建上千个。 */
+/** 时区 -> formatter。原来是每条消息都 new 一个，长会话能建上千个。
+ *  模块级 Map 在热重载后不会重建，所以设了硬上限：超了就整体清空 ——
+ *  时区数量正常只有一两个，这个上限纯粹是防泄漏的保险丝。 */
 const fmtCache = new Map()
+const FMT_CACHE_MAX = 16
 
 function formatterFor(tz) {
   if (fmtCache.has(tz)) return fmtCache.get(tz)
+  if (fmtCache.size >= FMT_CACHE_MAX) fmtCache.clear()
   let f = null
   try {
     f = new Intl.DateTimeFormat('zh-CN', {
@@ -199,6 +207,16 @@ function describeToolArgs(raw) {
     if (v.length > 140) v = v.slice(0, 140) + ' …'
     bits.push(k + '=' + v)
     if (bits.length >= 2) break
+  }
+  if (!bits.length) {
+    // 不认识的工具：直接取参数对象的前两个键，比整坨 JSON 截断可读。
+    for (const k of Object.keys(args).slice(0, 2)) {
+      let v = Array.isArray(args[k]) ? args[k].join(' | ')
+        : (args[k] && typeof args[k] === 'object' ? JSON.stringify(args[k]) : String(args[k]))
+      v = v.replace(/\s+/g, ' ').trim()
+      if (v.length > 140) v = v.slice(0, 140) + ' …'
+      bits.push(k + '=' + v)
+    }
   }
   if (!bits.length) bits.push(JSON.stringify(args).replace(/\s+/g, ' ').slice(0, 160))
   return bits.join('  ')
@@ -320,6 +338,13 @@ function render(records, opt) {
     }
   }
 
+  // 没等到 tool/result 的调用（被中断 / 结果丢失）：也要出现在文档里，
+  // 否则这类调用会整条消失，读记录时看不出"这里做过一次没完成的操作"。
+  for (const line of pendingTools.values()) {
+    out.push(line + '（无结果）')
+    out.push('')
+  }
+
   if (n === 0) out.push('（这次会话还没有对话内容）')
   return out.join('\n').replace(/\n+$/, '\n')
 }
@@ -383,9 +408,6 @@ function stripInlineMarks(line) {
   return s
 }
 
-/** 表格的分隔行（|---|---|）。 */
-const TABLE_SEP = /^\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?$/
-
 /**
  * 把一段 Markdown 正文变成纯文本。
  * 逐行处理：围栏代码块整段跳过（内容原样），其余行去标题井号、去引用 >、
@@ -443,11 +465,10 @@ export async function apply(ctx, config) {
     depth: 'plain',          // plain | summary | full
     skipSubagents: true,
     clean: true,             // 把助手/用户正文里的 Markdown 标记清成纯文本
-    tools: false,            // 是否注册 chatlog_export 手动导出工具（会占每次请求的 tool list）
+    archiveMissing: true,    // 会话文件已经不在磁盘上（删掉了/消失了）的文档也挪进「归档会话」
+    reconcileMs: 60000,      // 后台对账间隔（毫秒）；0 关闭定时对账
   }, config || {})
 
-  let defineTool = null
-  let toolsError = ''
 
   const warnings = []
   if (!DEPTHS.has(cfg.depth)) { warnings.push('depth 配置无效（' + cfg.depth + '），已回退 plain'); cfg.depth = 'plain' }
@@ -460,11 +481,10 @@ export async function apply(ctx, config) {
   const store = new Map()
   const stats = { written: 0, errors: 0, lastPath: '', lastError: '', lastWriteAt: '' }
   const recent = []          // 最近几条落盘记录，方便查"哪次会话写到哪了"
-  let lastActiveId = null
   const loadedAt = new Date().toISOString()
 
   /** 输出目录里的一份运行状态，出问题时直接看它。 */
-  function writeState() {
+  function writeStateNow() {
     try {
       fs.mkdirSync(cfg.dir, { recursive: true })
       const body = {
@@ -476,9 +496,10 @@ export async function apply(ctx, config) {
         dir: cfg.dir,
         depth: cfg.depth,
         clean: cfg.clean !== false,
+        archiveMissing: cfg.archiveMissing !== false,
+        reconcileMs: cfg.reconcileMs,
         enabled: cfg.enabled,
         skipSubagents: cfg.skipSubagents,
-        tools: typeof defineTool === 'function' ? 'chatlog_export' : (cfg.tools ? '(on, 不可用' + (toolsError ? ': ' + toolsError : '') + ')' : '(off)'),
         written: stats.written,
         errors: stats.errors,
         lastWriteAt: stats.lastWriteAt,
@@ -495,12 +516,50 @@ export async function apply(ctx, config) {
     } catch { /* 写不了状态文件不该让插件失效 */ }
   }
 
+  /**
+   * 节流版 writeState：高频对话时每次导出都写一遍状态文件纯属浪费 IO
+   * （writeFileSync + rename 每秒可能来好几次）。5 秒内最多落盘一次，
+   * 期间的变化由尾随定时器补写一次，保证最终状态不丢。
+   */
+  let lastStateWriteAt = 0
+  let stateTimer = null
+  const STATE_THROTTLE_MS = 5000
+  function writeState() {
+    const now = Date.now()
+    if (now - lastStateWriteAt >= STATE_THROTTLE_MS) {
+      lastStateWriteAt = now
+      writeStateNow()
+      return
+    }
+    if (stateTimer) return          // 已经有尾随写排在队里了
+    stateTimer = setTimeout(() => {
+      stateTimer = null
+      lastStateWriteAt = Date.now()
+      writeStateNow()
+    }, STATE_THROTTLE_MS - (now - lastStateWriteAt))
+    stateTimer.unref?.()            // 别为一份状态文件拖住进程退出
+  }
+
   // 插件一装好就把历史文档归位（旧目录迁移 + 归档分类）。放进微任务，
   // 因为 reconcile 要用的几个 const 还在下面才初始化。
   queueMicrotask(() => {
     try { reconcile(true) } catch { /* 对账失败绝不能挡住对话 */ }
     writeState()
   })
+
+  // 会话文件在 DSH 之外被删掉时**不会产生任何事件**，只靠"归档集合变了"是发现不了的。
+  // 所以再加一层低频对账：定时拍快照，快照变了才动文件。
+  // ctx.effect 保证插件热重载时旧定时器被清掉（否则会叠出好几个）。
+  const tickMs = Number(cfg.reconcileMs)
+  if (Number.isFinite(tickMs) && tickMs > 0) {
+    try {
+      ctx.effect(() => {
+        const timer = setInterval(() => { try { reconcile(false) } catch { /* 忽略 */ } }, tickMs)
+        if (typeof timer.unref === 'function') timer.unref()
+        return () => clearInterval(timer)
+      }, 'chatlog.reconcile')
+    } catch { /* 拿不到 effect 也不影响主功能，每轮结束仍会对账一次 */ }
+  }
 
   function entryFor(session) {
     let e = store.get(session.id)
@@ -555,14 +614,41 @@ export async function apply(ctx, config) {
   }
 
   /**
-   * 上次对账时的归档集合。对账只在集合**变了**或启动时跑一次 ——
+   * 拍一张"归属快照"：
+   *
+   *   arch  —— workspace.json 里的归档 id 集合（null 表示读不到）
+   *   alive —— 磁盘上**还有会话文件**的 id；外加本进程正在跟踪的会话
+   *            （第一轮的会话文件可能还没落盘，不能因此把文档判成"不见了"）
+   *
+   * 判据很简单：**只有"活着且没被归档"的会话，文档才留在 dsh会话 根目录**；
+   * 其余一律进 归档会话 子目录 —— 归档的、以及会话文件已经消失的都算。
+   */
+  function snapshot() {
+    const arch = archivedIds()
+    const alive = new Set()
+    try { for (const c of candidateFiles()) alive.add(c.id) } catch { /* 读不到就当没有 */ }
+    for (const id of store.keys()) alive.add(id)
+    return { arch, archKnown: !!arch, alive }
+  }
+
+  /** 这份文档该不该待在「归档会话」里。 */
+  function isArchivedDoc(sessionId, snap) {
+    if (snap && snap.archKnown && snap.arch.has(sessionId)) return true
+    // 会话文件不见了 = 这个对话在本机已经不存在了，也归到归档里。
+    // alive 为空说明会话目录整体读不到，此时一律不动，免得整柜文档被搬走。
+    if (cfg.archiveMissing && snap && snap.alive.size > 0 && !snap.alive.has(sessionId)) return true
+    return false
+  }
+
+  /**
+   * 上次对账时的快照键。对账只在**归档集合或活会话集合变了**、或启动时跑一次 ——
    * 每轮都全目录对账既慢，又会把用户手工整理的文档搬回去。
    */
-  const archState = { key: null, set: null }
+  const archState = { key: null, snap: null }
 
-  /** 会话该落在哪个目录：进了归档集合就进「归档会话」子目录。 */
-  function dirFor(sessionId, arch) {
-    return arch && arch.has(sessionId) ? path.join(cfg.dir, ARCHIVE_SUBDIR) : cfg.dir
+  /** 会话该落在哪个目录：正常会话在根目录，归档/已消失的进「归档会话」。 */
+  function dirFor(sessionId, snap) {
+    return isArchivedDoc(sessionId, snap) ? path.join(cfg.dir, ARCHIVE_SUBDIR) : cfg.dir
   }
 
   /**
@@ -598,21 +684,34 @@ export async function apply(ctx, config) {
    * 已经有别的会话的 `X.txt`，直接写就会把别人的文档覆盖掉。所以落笔前
    * 还要读一下磁盘上同名文件的文档头 —— 里面记着真正的会话 id。
    */
-  function outPath(sessionId, records, arch) {
+  function outPath(sessionId, records, snap) {
     const short = shortOf(sessionId)
     const all = records || [...(store.get(sessionId)?.records?.values() ?? [])]
     let base = titleToBase(titleOf(all), sessionId)
-    const dir = dirFor(sessionId, arch)
+    const dir = dirFor(sessionId, snap || currentSnapshot())
     const holder = fileOwner.get(base)
     if (holder && holder !== sessionId) base = base + '-' + short
-    const file = path.join(dir, base + '.txt')
-    const diskOwner = fs.existsSync(file) ? ownerOf(file) : null
-    let final = file
-    let finalBase = base
-    if (diskOwner && diskOwner !== sessionId) {
-      finalBase = base + '-' + short
-      final = path.join(dir, finalBase + '.txt')
+    // 碰撞兜底：内存占用或磁盘上同名文件的文档头属于别的会话，就继续
+    // 追加会话号的更多位。理论上 short(8位) 碰撞概率极低，但旧代码在
+    // 二次碰撞时会直接覆盖别人的文档，这里循环到找到空位为止。
+    const taken = (name) => {
+      const h = fileOwner.get(name)
+      if (h && h !== sessionId) return true
+      const f = path.join(dir, name + '.txt')
+      const d = fs.existsSync(f) ? ownerOf(f) : null
+      return !!(d && d !== sessionId)
     }
+    let finalBase = base
+    if (taken(finalBase)) {
+      const bare = String(sessionId).replace(/^session-/, '')
+      let n = 12
+      finalBase = base + '-' + bare.slice(0, n)
+      while (taken(finalBase) && n < bare.length) {
+        n += 4
+        finalBase = base + '-' + bare.slice(0, n)
+      }
+    }
+    const final = path.join(dir, finalBase + '.txt')
     fileOwner.set(finalBase, sessionId)
     return final
   }
@@ -629,11 +728,16 @@ export async function apply(ctx, config) {
     }
   }
 
-  /** 跨设备/跨挂载点搬文件：rename 失败就退化成复制 + 删除。 */
+  /** 跨设备/跨挂载点搬文件：rename 失败就退化成复制 + 删除。
+ *  删除失败时源和目标会同时存在，必须留痕 —— 否则两份同名文档
+ *  各在一边，对账时又互相覆盖，完全查不出原因。 */
   function moveFile(src, dest) {
     try { fs.renameSync(src, dest) } catch {
       fs.copyFileSync(src, dest)
-      fs.unlinkSync(src)
+      try { fs.unlinkSync(src) } catch (err) {
+        try { ctx.logger?.warn?.('chatlog: 复制成功但源文件删不掉（两边各有一份，下次对账会重试）'
+          + ' ' + src + ' → ' + dest + ': ' + String(err && err.message || err)) } catch { /* 忽略 */ }
+      }
     }
   }
 
@@ -656,14 +760,17 @@ export async function apply(ctx, config) {
     }
   }
 
-  /** 清掉崩溃残留的 .tmp（只清够老的，避免误删正在写的）。 */
+  /** 清掉崩溃残留的临时文件。
+ *  tmpTag() 生成的名字是 `<目标名>.<pid>.<时间戳36>.<序号36>`，以前只匹配
+ *  `.tmp` 后缀，一个都清不到。现在两种都认。只清够老的，避免误删正在写的。 */
+  const TMP_RE = /\.(?:tmp|\d+\.[a-z0-9]+\.[a-z0-9]+)$/
   function cleanupTmp(dirs) {
     const now = Date.now()
     for (const d of dirs) {
       let names = []
       try { names = fs.readdirSync(d) } catch { continue }
       for (const n of names) {
-        if (!n.endsWith('.tmp')) continue
+        if (!TMP_RE.test(n)) continue
         const p = path.join(d, n)
         try {
           const st = fs.statSync(p)
@@ -679,50 +786,66 @@ export async function apply(ctx, config) {
    * 认人的依据是**文档头里记的完整会话 id**，不是文件名 —— 文件名跟着标题走，
    * 靠它认会话迟早认错。只处理首行是 `DSH 对话记录` 的文件，别的文件一概不碰。
    *
-   * @param {boolean} force - 启动时强制跑一次；之后只在归档集合变化时跑。
+   * 归属规则（用户要求）：**只有正常会话的文档留在 dsh会话 根目录**；
+   * 只要被归档、或者会话文件已经不在磁盘上了，就搬进 归档会话 子目录。
+   *
+   * @param {boolean} force - 启动时强制跑一次；之后只在快照变化时跑。
    */
   function reconcile(force) {
-    const arch = archivedIds()
-    if (!arch) return   // 状态文件读不到就别动任何文档
-    const key = [...arch].sort().join('|')
+    const snap = snapshot()
+    const key = (snap.archKnown ? [...snap.arch].sort().join('|') : '?')
+      + '#' + [...snap.alive].sort().join(',')
     if (!force && archState.key === key) return
     archState.key = key
-    archState.set = arch
+    archState.snap = snap
 
     const archDir = path.join(cfg.dir, ARCHIVE_SUBDIR)
     try { fs.mkdirSync(cfg.dir, { recursive: true }) } catch { /* 忽略 */ }
     cleanupTmp([cfg.dir, archDir])
 
-    // 1) 旧目录里的历史文档 → 按归档状态迁进新目录
+    // 1) 旧目录里的历史文档 → 迁进新目录（并按归档/存活状态分好类）。
+    //    旧目录必须是真目录：如果它被换成指向别处的符号链接，
+    //    照着搬会把无关位置的文件搬走 —— 直接跳过并留警告。
     try {
-      for (const n of fs.readdirSync(LEGACY_DIR)) {
-        if (!n.endsWith('.txt')) continue
-        const src = path.join(LEGACY_DIR, n)
-        const sid = ownerOf(src)
-        if (sid) relocate(src, dirFor(sid, arch), sid)
+      const lst = fs.lstatSync(LEGACY_DIR)
+      if (lst.isSymbolicLink()) {
+        warnings.push('LEGACY_DIR 是符号链接，跳过迁移: ' + LEGACY_DIR)
+      } else if (lst.isDirectory()) {
+        for (const n of fs.readdirSync(LEGACY_DIR)) {
+          if (!n.endsWith('.txt')) continue
+          const src = path.join(LEGACY_DIR, n)
+          const sid = ownerOf(src)
+          if (sid) relocate(src, dirFor(sid, snap), sid)
+        }
       }
     } catch { /* 旧目录不存在就算了 */ }
 
-    // 2) 主目录与归档目录之间互搬（归档就进子目录，取消归档就搬回来）
-    for (const [from, wanted] of [[cfg.dir, false], [archDir, true]]) {
+    // 2) 主目录与归档目录之间互搬：
+    //    该归档的在根目录 → 进子目录；不该归档的（恢复正常）→ 搬回根目录。
+    //    归档集合读不到时只做"搬进"，不做"搬出" —— 免得把归档文档全倒回主目录。
+    for (const from of [cfg.dir, archDir]) {
       let names = []
       try { names = fs.readdirSync(from) } catch { continue }
+      const inArchive = path.resolve(from) === path.resolve(archDir)
       for (const n of names) {
         if (!n.endsWith('.txt')) continue
         const src = path.join(from, n)
         const sid = ownerOf(src)
         if (!sid) continue                        // 不是我们的文件
-        if (arch.has(sid) !== wanted) relocate(src, dirFor(sid, arch), sid)
+        const want = isArchivedDoc(sid, snap)
+        if (inArchive === want) continue          // 已经在正确的一边
+        if (inArchive && !snap.archKnown) continue // 读不到归档集合就不搬出子目录
+        relocate(src, dirFor(sid, snap), sid)
       }
     }
   }
 
-  /** 当前该用哪份归档集合（对账没跑过就现读一次）。 */
-  function archNow() {
-    if (archState.set) return archState.set
-    const a = archivedIds()
-    if (a) archState.set = a
-    return a || new Set()
+  /** 当前该用哪份快照（对账跑过就复用，没跑过现拍一张）。 */
+  function currentSnapshot() {
+    if (archState.snap) return archState.snap
+    const s = snapshot()
+    archState.snap = s
+    return s
   }
 
   /** 渲染并写盘。任何异常都吞掉并记进 stats —— 绝不能影响对话。 */
@@ -732,10 +855,10 @@ export async function apply(ctx, config) {
       const e = store.get(sessionId)
       if (!e || e.records.size === 0) return { ok: false, reason: '没有这个会话的内存记录' }
       const records = [...e.records.values()]
-      try { reconcile(false) } catch { /* 顺带把归档/取消归档的文档搬到位 */ }
-      const arch = archNow()
+      try { reconcile(false) } catch { /* 顺带把归档/取消归档/已消失的文档搬到位 */ }
+      const snap = currentSnapshot()
       const text = render(records, { depth: depthOverride || cfg.depth, sessionId, clean: cfg.clean !== false })
-      const target = outPath(sessionId, records, arch)
+      const target = outPath(sessionId, records, snap)
       fs.mkdirSync(path.dirname(target), { recursive: true })
       const prev = currentFile.get(sessionId)
       const tmp = target + '.' + tmpTag()
@@ -805,7 +928,6 @@ export async function apply(ctx, config) {
       if (!e.header && session.header) e.header = session.header
       e.records.set(event.seq, event)
       e.lastSeen = Date.now()
-      lastActiveId = session.id
       trimStore(session.id)
 
       // turn/end 就是"这一轮答完了"。它自己也是最后一条记录，
@@ -815,101 +937,6 @@ export async function apply(ctx, config) {
       try { ctx.logger?.warn?.('chatlog: 事件处理失败 ' + String(err && err.message)) } catch { /* 忽略 */ }
     }
   })
-
-  /* ---- 手动导出工具 ----
-   * 动态 import：万一 @deepseek-ai/dsh-tools 在这个 profile 里解析不到，
-   * 插件本身仍能正常加载、自动导出照常工作，只是少这一个工具 ——
-   * 而不是整个模块 import 失败把插件拖死。
-   *
-   * 默认**关闭**：它的 schema 会跟着每一次 API 请求发出去（约 300 token），
-   * 不用的时候没必要占这份额度。自动导出完全不依赖它。
-   * 想开就改配置 tools: true —— 不需要改代码。 */
-  if (cfg.tools) {
-    try {
-      ({ defineTool } = await import('@deepseek-ai/dsh-tools'))
-    } catch (err) {
-      toolsError = String(err && err.message ? err.message : err)
-      try { ctx.logger?.warn?.('chatlog: 加载 dsh-tools 失败，手动导出工具不可用 ' + toolsError) } catch { /* 忽略 */ }
-    }
-  }
-  if (cfg.tools && typeof defineTool === 'function') ctx.tools.register(defineTool({
-
-    name: 'chatlog_export',
-    description: '把某次 DSH 对话导出成本地纯文本 .txt。'
-      + '不传参数就是"把当前这次对话导出成最新状态"，等价于自动导出干的事。'
-      + 'depth=plain 只要对话正文（默认）；summary 多一行工具摘要；full 含思考过程和工具输入输出。',
-    parameters: {
-      session: { type: 'string', description: '会话 id（写前几位即可），或 latest 表示最近一次。省略=当前对话。' },
-      depth: { type: 'string', enum: ['plain', 'summary', 'full'], description: '内容深度，默认 plain。' },
-      out: { type: 'string', description: '指定输出文件路径，必须在插件配置的目录里面。' },
-    },
-    output: {
-      schema: { type: 'string' },
-      render: (_args, value) => [{ type: 'text', text: String(value) }],
-    },
-    async execute(args) {
-      const depth = args && DEPTHS.has(args.depth) ? args.depth : cfg.depth
-      const want = args && args.session ? String(args.session) : ''
-
-      // 1) 命内存里已有的会话（正常情况下就是当前这次对话）
-      let sessionId = null
-      if (!want) {
-        sessionId = lastActiveId || [...store.keys()].pop() || null
-      } else if (want !== 'latest') {
-        sessionId = [...store.keys()].find((k) => k.includes(want)) || null
-      }
-
-      // 2) 内存里没有（比如要导一次很久以前的对话）→ 从磁盘读
-      let records = null
-      let file = null
-      if (sessionId && store.has(sessionId)) {
-        records = [...store.get(sessionId).records.values()]
-      } else {
-        const all = candidateFiles()
-        const hit = want && want !== 'latest'
-          ? all.find((c) => c.id.includes(want))
-          : all[0]
-        if (!hit) return want ? ('找不到会话：' + want) : '找不到任何会话记录。'
-        records = decodeSessionFile(hit.file)
-        file = hit.file
-        sessionId = (records.find((r) => r.type === 'session') || {}).id || hit.id
-      }
-
-      const text = render(records, { depth, sessionId, clean: cfg.clean !== false })
-      const root = path.resolve(cfg.dir)
-      let target
-      if (args && args.out) {
-        target = path.resolve(String(args.out))
-        if (target !== root && !target.startsWith(root + path.sep)) {
-          return 'out 只能写在导出目录里面：' + cfg.dir + '\n（这是为了避免一次导出把文件写到系统任意位置。）'
-        }
-      } else {
-        target = outPath(sessionId, records, archNow())
-      }
-      try {
-        fs.mkdirSync(path.dirname(target), { recursive: true })
-        const tmp = target + '.' + tmpTag()
-        try {
-          fs.writeFileSync(tmp, text, 'utf8')
-          fs.renameSync(tmp, target)
-        } catch (err) {
-          try { fs.unlinkSync(tmp) } catch { /* 忽略 */ }
-          throw err
-        }
-      } catch (err) {
-        return '写文件失败：' + String(err && err.message ? err.message : err)
-      }
-      currentFile.set(sessionId, target)
-      stats.lastPath = target
-      stats.lastWriteAt = new Date().toISOString()
-      recent.unshift({ session: sessionId, file: target, at: stats.lastWriteAt })
-      if (recent.length > 5) recent.pop()
-      writeState()
-      const kb = (Buffer.byteLength(text, 'utf8') / 1024).toFixed(1)
-      return '已导出 ' + sessionId + '（depth=' + depth + '）→ ' + target + '  (' + kb + ' KB)'
-        + (file ? '\n来源文件：' + file : '\n来源：内存中的实时会话记录')
-    },
-  }))
 
   /* ---- 启动时就把状态写出来：装上了 ≠ 真的生效 ---- */
   writeState()

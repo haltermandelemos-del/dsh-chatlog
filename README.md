@@ -1,6 +1,6 @@
 # dsh-chatlog
 
-每轮对话结束，自动把当前 DSH 会话写成本地纯文本 `.txt`；另外提供一个手动导出工具（默认关闭）。
+每轮对话结束，自动把当前 DSH 会话写成本地纯文本 `.txt`。只做自动导出，不注册任何工具。
 
 装上就不用管了 —— 聊天过程中什么都不用做，说完一轮，文档自己就在那了。
 文档统一放在“dsh会话”文件夹里。
@@ -17,13 +17,13 @@
 # 从仓库打一个包
 git clone https://github.com/haltermandelemos-del/dsh-chatlog.git
 cd dsh-chatlog
-npm pack                      # 生成 dsh-chatlog-0.1.8.tgz
+npm pack                      # 生成 dsh-chatlog-0.2.0.tgz
 
 # 或者不装 git，直接下 Release 里现成的 tgz：
 # https://github.com/haltermandelemos-del/dsh-chatlog/releases
 
 # 装进 DSH 的 profile（web 是默认 profile 名，按自己的改）
-dsh plugin --profile web add ./dsh-chatlog-0.1.8.tgz
+dsh plugin --profile web add ./dsh-chatlog-0.2.0.tgz
 ```
 
 装完 `dsh --profile web --dump-config` 里能看到 `- id: chatlog`。
@@ -43,7 +43,7 @@ dsh plugin --profile web add ./dsh-chatlog-0.1.8.tgz
 ├── 帮我写一个备份脚本.txt        ← 一个会话 = 一个文档，每轮覆盖成最新
 ├── 安装最新版chatlog插件.txt
 ├── .chatlog-state.json          ← 插件自己的运行状态（见"自检"）
-└── 归档会话/                     ← 在 DSH 里"删除"的会话挪到这里
+└── 归档会话/                     ← 归档的、以及已经消失的会话挪到这里
     └── 旧的对话.txt
 ```
 
@@ -70,7 +70,11 @@ DSH 对话记录
 - 标题里的 `/ : * ? " < > |` 换成空格，超过 40 字截断。
 - **两个会话同名也不打架**：内存里按标题登记占用，落笔前还会读磁盘上同名文档的头部核对会话 id —— 撞名就自动追加 8 位会话号（重启后也一样，不会互相覆盖）。
 - 写盘是"临时文件 + rename"原子替换，不会读到写了一半的文档。
-- 在 DSH 里**删除会话**其实只是归档：文档会被挪进 `归档会话/`；取消归档再挪回来。
+- **目录归属只有两档**：正常会话的文档留在 `dsh会话/` 根目录；其余的（被归档的、以及会话文件已经不在磁盘上的）一律进 `归档会话/`。
+  - 在 DSH 里**删除会话**其实只是归档（`workspace.json` 的 `archivedSessionIds`）：文档会被挪进 `归档会话/`；取消归档再挪回来。
+  - **会话文件消失了也算**：会话目录被删掉/清掉后，对应文档也会被挪进 `归档会话/`，根目录里只留还活着的会话。
+  - 判断依据始终是文档头里的完整会话 id；不是本插件生成的 txt 一概不碰。
+  - 对账时机：启动时、每次 turn/end、以及后台每 `reconcileMs`（默认 60 秒）一次；快照（归档集合 + 活会话集合）没变就不动文件。
 
 ## 符号：正文会清成纯文本
 
@@ -121,8 +125,9 @@ DSH 对话记录
     dir: /sdcard/dsh/dsh会话
     depth: plain        # plain | summary | full
     clean: true         # 把正文里的 Markdown 标记清成纯文本（默认开）
+    archiveMissing: true # 会话文件已不在磁盘上的文档也挪进「归档会话」（默认开）
+    reconcileMs: 60000  # 后台对账间隔（毫秒，0 = 只在启动和每轮结束时对账）
     skipSubagents: true
-    tools: false        # 是否注册 chatlog_export 手动导出工具（默认 false）
 ```
 
 > ⚠️ **别写成 `- insert: - id: chatlog`**。这个插件的 bundle 层（自带的
@@ -132,20 +137,30 @@ DSH 对话记录
 > 按 id 覆盖是对的 —— DSH 会把这条 patch 合并到已有 entry 上。
 
 只写你要改的键就行，其余沿用默认值（默认值：`enabled: true`、`depth: plain`、
-`dir: /sdcard/dsh/dsh会话`、`clean: true`、`skipSubagents: true`、`tools: false`）。
+`dir: /sdcard/dsh/dsh会话`、`clean: true`、`archiveMissing: true`、`reconcileMs: 60000`、`skipSubagents: true`）。
 
 配置写错（比如 `depth: deeply`）不会让插件崩掉：回退到默认值，并把原因记进状态文件的 `warnings`。
 
-## 手动导出工具（默认关闭）
+> 📌 **`archiveMissing` 与内存上限的交互**：插件内存里最多缓存 12 个活跃会话
+> （LRU 淘汰）。被淘汰的会话如果它的磁盘会话文件（`session.v4.jsonl[.zstd]`）
+> 也恰好被删了（比如你在 DSH 里删除了会话），下一次对账就会判定"会话不见了"，
+> 把它的文档挪进「归档会话」。这是**预期行为**：判断依据始终是磁盘上的会话
+> 文件，不是内存缓存 —— 内存淘汰本身不会触发归档。如果你不希望"消失的会话"
+> 被归档，把 `archiveMissing: false`，那样只有你在 DSH 界面里明确归档的会话
+> 才会进子目录。
 
-`chatlog_export` 的 schema 会跟着**每一次 API 请求**发出去（约 300 token）。
-不用它的时候把 `tools` 留在 `false` —— 自动导出完全不受影响。
+## 只有自动导出
 
-开了之后：
+插件**只提供自动导出**：每轮 `turn/end` 把会话写成 .txt，不注册任何工具。
+早先版本有一个可选的 `chatlog_export` 手动导出工具，v0.2.0 已移除 ——
+它的 schema 要常驻每次 API 请求（约 300 token），而自动导出已经覆盖了日常需要。
 
-- `session`：会话 id（写前几位即可）或 `latest`；省略 = 当前对话
-- `depth`：`plain` / `summary` / `full`
-- `out`：输出路径，**必须在配置的导出目录里面**（防止一次导出把文件写到系统任意位置）
+需要一次性导出历史会话时，直接读会话文件就行（插件内部也是这么做的）：
+
+```bash
+# 会话文件是多个 zstd 帧拼接的，zstd -d 只解第一帧，所以要按帧切开
+ls /root/.dsh/sessions/--root--/session-*/session.v4.jsonl*
+```
 
 ## 自检
 
@@ -154,7 +169,7 @@ DSH 对话记录
 ```json
 {
   "plugin": "dsh-chatlog",
-  "version": "0.1.8",
+  "version": "0.1.10",
   "hook": "session/event (turn/end)",
   "loadedAt": "2026-10-20T11:30:09.000Z",
   "updatedAt": "2026-10-20T11:35:33.000Z",
@@ -185,6 +200,6 @@ DSH 对话记录
 
 - **不导出你在这台机器之外发生的事**：只记录本 profile 的会话文件。
 - 插件只处理首行是 `DSH 对话记录` 的文档，目录里别的文件一概不碰。
-- 归档对账在**启动时**和**归档集合变化时**各跑一次，不是每轮都跑 —— 因此你手工把文档挪到别处后，不会被立刻搬回来。
+- 对账只在**启动时**、**每次 turn/end**、以及**每 reconcileMs（默认 60 秒）**跑，且只有快照（归档集合 / 活会话集合）变了才动文件 —— 你手工把文档挪到别处后，不会被立刻搬回来。
 - `plain` 模式下工具调用完全不出现；想看到"它都干了什么"用 `summary`。
 - 零第三方依赖，安装不需要联网。
