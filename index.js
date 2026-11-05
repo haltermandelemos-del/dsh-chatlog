@@ -1,4 +1,4 @@
-// dsh-chatlog v0.3.0 —— 把每个会话导出成本地纯文本文档
+// dsh-chatlog v0.4.0 —— 把每个会话导出成本地纯文本文档
 //
 // 规则只有一条：
 //   还活着的会话     → <dir>/<标题>-<会话号>.txt
@@ -8,14 +8,21 @@
 // “归档” = ~/.dsh/storages/workspace.json 的 global.archivedSessionIds 里
 //          有它（DSH 界面上的“删除会话”其实就是归档，文件原地不动）。
 //
+// 文档不是“追加出来的”，而是“对账出来的”：会话文件是唯一真源，文档是派生物。
+// 每次变动都重新算一遍期望内容，再和磁盘上的实际内容比，只改不一致的地方。
+//
 // 几条不写在注释里就会被人改坏的约定：
 //   1. 只碰“自己写的”文件 —— 文件头里有 `会话  session-...` 那行才算自己的，
 //      别人的 .txt 一律不读不写不删不改名。
 //   2. 临时文件名固定带 `.chatlog-<pid>.<tag>.tmp` 尾巴，清理时只认这个形状，
 //      不会把用户自己的 `备份.2024.10.15` 当成垃圾删掉。
 //   3. 目标文件名总是带 8 位会话号，天然不撞车，不需要任何“占用检测”。
-//   4. 归档集合读不到就一率不搬文件；会话目录读不到就不判“已消失”。
+//   4. 归档集合读不到就一律不搬文件；会话目录读不到就不判“已消失”。
 //      两个方向都选“不动”，宁可少搬一次，也不能把整柜文档搬错地方。
+//   5. 会话文件已经不在了 → 文档只搬不写。源没了，内容重建不出来，
+//      那份 .txt 就是唯一存本，任何“期望内容”都不该覆盖它。
+//   6. 会话日志是 append-only 的，所有“改动”都表现为后写的 surfaceOp.replace。
+//      渲染时必须按它折叠，否则会把每个历史版本的草稿都当成正文写进文档。
 import fs from 'node:fs'
 import path from 'node:path'
 import { homedir } from 'node:os'
@@ -23,7 +30,7 @@ import { zstdDecompressSync } from 'node:zlib'
 
 export const name = 'chatlog'
 
-const VERSION = '0.3.0'
+const VERSION = '0.4.0'
 const SESSION_ROOT = path.join(homedir(), '.dsh', 'sessions')
 const WORKSPACE_STATE = path.join(homedir(), '.dsh', 'storages', 'workspace.json')
 const DEFAULT_DIR = '/sdcard/dsh/DshChat'
@@ -32,11 +39,22 @@ const STATE_FILE = '.chatlog-state.json'
 const ZSTD_MAGIC = 0xfd2fb528
 /** 进程内最多缓存几个会话的完整记录。 */
 const MAX_SESSIONS = 8
+/** 磁盘文档缓存条数（只为准确定位差异用，随时可以丢）。 */
+const MAX_DOC_CACHE = 32
 /** 只认自己写的临时文件，绝不误伤用户文件。 */
 const TMP_TAIL = /\.chatlog-\d+\.[0-9a-z]+\.tmp$/
 const TMP_TTL_MS = 6 * 60 * 60 * 1000
 /** 文件头里记录归属的那一行。 */
 const OWNER_RE = /^会话[ \t]+(session-\S+)[ \t]*$/m
+/**
+ * 块头：`\n—— 2026/10/30 22:53:06 · 你 ——`
+ * 只用在“把磁盘文档拆回块”的时候；时间格式化固定，误判概率可以忽略。
+ */
+const CHUNK_HEAD = /\n—— \d{4}\/\d{2}\/\d{2} \d{2}:\d{2}:\d{2} · [^\n]* ——(?=\n)/g
+/** 能进“表面”的事件类型（与 DSH 会话格式一致）。 */
+const SURFACE_TYPES = new Set([
+  'system/message', 'developer/message', 'user/message', 'assistant/message', 'tool/result',
+])
 
 /* ================================================================== *
  * zstd 多帧解码
@@ -98,7 +116,7 @@ function readRecords(file) {
   }
 }
 
-/** 扫描所有会话文件：id -> { file, mtimeMs }。目录读不到返回 null。 */
+/** 扫描所有会话文件：id -> { file, mtimeMs, size }。目录读不到返回 null。 */
 function scanSessions() {
   let projects
   try {
@@ -118,7 +136,7 @@ function scanSessions() {
         let st
         try { st = fs.statSync(p) } catch { continue }
         if (!st.isFile()) continue
-        out.set(n, { file: p, mtimeMs: st.mtimeMs })
+        out.set(n, { file: p, mtimeMs: st.mtimeMs, size: st.size })
         break
       }
     }
@@ -228,59 +246,118 @@ function titleOf(records) {
   return t
 }
 
-/** 整个文档的正文。records 按 seq 排好序。 */
-function render(id, records, opt) {
+/* ================================================================== *
+ * 表面折叠
+ *
+ * 会话日志只追加。删消息、改消息、回退重做，都是再写一条带
+ *   surfaceOp: { op:'replace', startSeq, endSeq }
+ * 的事件，把旧的那一段从“表面”上摘掉。DSH 自己读会话也是这么折叠的，
+ * 不按它折，就会把每个历史版本都当成正文导出。
+ *
+ * 这里只认结构（三个键 + op==='replace'），不认任何插件、任何 id 前缀。
+ * ================================================================== */
+function foldShadow(records) {
+  const nodes = []          // 当前表面：事件 seq 的顺序表
+  const dead = new Set()    // 已被摘掉的事件 seq
+  for (const r of records) {
+    const op = r && r.surfaceOp
+    if (op && typeof op === 'object' && op.op === 'replace' &&
+        Number.isSafeInteger(op.startSeq) && Number.isSafeInteger(op.endSeq)) {
+      const a = nodes.indexOf(op.startSeq)
+      const b = nodes.indexOf(op.endSeq)
+      if (a < 0 || b < 0 || a > b) continue      // 端点缺失：跳过，不崩
+      for (let i = a; i <= b; i += 1) dead.add(nodes[i])
+      nodes.splice(a, b - a + 1, r.seq)
+    } else if (SURFACE_TYPES.has(r.type)) {
+      nodes.push(r.seq)
+    }
+  }
+  return dead
+}
+
+/** turn 级存活表：该 turn 的助手回复全被摘掉时，它的工具行也没意义。 */
+function turnAlive(records, dead) {
+  const out = new Map()
+  for (const r of records) {
+    if (r.type !== 'assistant/message') continue
+    const t = r.data && r.data.turn
+    if (typeof t !== 'number') continue
+    const cur = out.get(t) || { total: 0, alive: 0 }
+    cur.total += 1
+    if (!dead.has(r.seq)) cur.alive += 1
+    out.set(t, cur)
+  }
+  return out
+}
+
+/**
+ * 渲染成“头 + 块”。
+ * 块是最小可寻址单位：追加时只写新块，前面的一个字节都不用动。
+ */
+function renderDoc(id, records, opt) {
   const head = records.find(r => r.type === 'session') || {}
+  const dead = foldShadow(records)
+  const turns = turnAlive(records, dead)
+
   const L = []
   L.push('DSH 对话记录')
   L.push('标题  ' + (titleOf(records) || '（无标题）'))
   L.push('会话  ' + id)
   if (head.cwd) L.push('目录  ' + head.cwd)
   L.push('开始  ' + fmtTime(head.createdAt, opt.tz))
-  L.push('导出  ' + fmtTime(Date.now(), opt.tz))
   L.push('时区  ' + opt.tz)
 
-  const body = []
-  let lastBlock = ''       // 'user' | 'assistant' | 'tool'
+  const chunks = []
+  let cur = null
+  let lastBlock = ''        // '你' | '助手' | '思考' | '工具'
   let lastTurn = null
   const callNames = new Map()
 
-  const openBlock = (kind, time, force) => {
+  const open = (kind, time, force) => {
     if (!force && lastBlock === kind) return
-    body.push('')
-    body.push('—— ' + fmtTime(time, opt.tz) + ' · ' + kind + ' ——')
+    cur = { kind, lines: ['—— ' + fmtTime(time, opt.tz) + ' · ' + kind + ' ——'] }
+    chunks.push(cur)
     lastBlock = kind
+  }
+  const push = (line) => {
+    if (!cur) open('正文', Date.now(), true)
+    cur.lines.push(line)
+  }
+  const turnGone = (turn) => {
+    const t = turns.get(turn)
+    return Boolean(t && t.total > 0 && t.alive === 0)
   }
 
   for (const r of records) {
+    if (dead.has(r.seq)) continue              // 被表面操作摘掉的历史版本
     const d = r.data || {}
     if (r.type === 'user/message') {
       const kind = d.source && d.source.kind
-      if (kind && kind !== 'user') continue        // 注入的上下文不算对话
+      if (kind && kind !== 'user') continue    // 注入的上下文不算对话
       const text = body_(contentText(d.content), opt)
       if (!text) continue
-      openBlock('你', r.time, false)
-      body.push(text)
-      lastTurn = null
+      open('你', r.time, false)
+      push(text)
     } else if (r.type === 'assistant/message') {
+      if (turnGone(d.turn)) continue
       const content = (d.message && d.message.content) || d.content
       if (opt.showReasoning) {
         const rt = body_(reasoningText(content), opt)
-        if (rt) { openBlock('思考', r.time, false); body.push(rt) }
+        if (rt) { open('思考', r.time, false); push(rt) }
       }
       const text = body_(contentText(content), opt)
-      if (text) { openBlock('助手', r.time, false); body.push(text) }
+      if (text) { open('助手', r.time, false); push(text) }
       lastBlock = ''
     } else if (r.type === 'tool/call') {
       if (!opt.showTools) continue
+      if (turnGone(d.turn)) continue
       callNames.set(d.callId, d.name)
-      if (lastTurn !== d.turn || lastBlock !== '工具') {
-        openBlock('工具', r.time, true)
-      }
+      if (lastTurn !== d.turn || lastBlock !== '工具') open('工具', r.time, true)
       lastTurn = d.turn
-      body.push('→ ' + (d.name || '工具') + ' ' + clip(d.arguments || '{}', 160))
+      push('→ ' + (d.name || '工具') + ' ' + clip(d.arguments || '{}', 160))
     } else if (r.type === 'tool/result') {
       if (!opt.showTools) continue
+      if (turnGone(d.turn)) continue
       const name = callNames.get(d.toolCallId) || '结果'
       let text = body_(contentText(d.content || (d.message && d.message.content)), opt)
       const rows = text ? text.split('\n') : []
@@ -288,14 +365,59 @@ function render(id, records, opt) {
       if (rows.length > limit) {
         text = rows.slice(0, limit).join('\n') + '\n…（还有 ' + (rows.length - limit) + ' 行）'
       }
-      if (lastBlock !== '工具') { openBlock('工具', r.time, true); lastTurn = d.turn }
-      body.push('← ' + name + (d.isError ? '（失败）' : '') + (text ? '' : '（无输出）'))
-      if (text) for (const line of text.split('\n')) body.push('  ' + line)
+      if (lastBlock !== '工具') { open('工具', r.time, true); lastTurn = d.turn }
+      push('← ' + name + (d.isError ? '（失败）' : '') + (text ? '' : '（无输出）'))
+      if (text) for (const line of text.split('\n')) push('  ' + line)
     }
   }
 
-  if (!body.length) body.push('', '（这次会话还没有可导出的对话内容）')
-  return L.join('\n') + '\n' + body.join('\n').replace(/\n+$/, '') + '\n'
+  if (!chunks.length) {
+    open('无内容', head.createdAt || Date.now(), true)
+    push('（这次会话还没有可导出的对话内容）')
+  }
+
+  // 块文本统一以换行开头：这样文档 = 头 + 若干块 + 结尾换行，追加时天然对齐
+  const out = chunks.map(c => '\n' + c.lines.join('\n'))
+  return { head: L.join('\n'), chunks: out }
+}
+
+/* ================================================================== *
+ * 磁盘文档 ↔ 块
+ * ================================================================== */
+/** 把磁盘上的文档拆回 头 + 块。返回 null 表示格式对不上（当成需要重写）。 */
+function splitDoc(text) {
+  const marks = []
+  CHUNK_HEAD.lastIndex = 0
+  let m
+  while ((m = CHUNK_HEAD.exec(text))) marks.push(m.index)
+  if (!marks.length) return null
+  const prefix = text.slice(0, marks[0])
+  const chunks = []
+  for (let i = 0; i < marks.length; i += 1) {
+    const end = i + 1 < marks.length ? marks[i + 1] : text.length
+    chunks.push(text.slice(marks[i], end))
+  }
+  // 文档固定以一个换行收尾，它不属于最后一块
+  const last = chunks.length - 1
+  if (chunks[last].endsWith('\n')) chunks[last] = chunks[last].slice(0, -1)
+  return { prefix, chunks }
+}
+
+/**
+ * 从尾往前找差异，再决定怎么落盘。
+ *   - 头不一样            → 整份重写（标题/目录变了，没得省）
+ *   - 完全一样            → 一个字都不写
+ *   - 只有尾部多出来      → 追加（最常见的路径）
+ *   - 中间有变化          → 截断到分歧点再追加
+ */
+function diffChunks(diskChunks, nextChunks) {
+  let p = 0
+  while (p < diskChunks.length && p < nextChunks.length && diskChunks[p] === nextChunks[p]) p += 1
+  if (p === diskChunks.length && p === nextChunks.length) return { from: p, same: true }
+  let s = 0
+  while (s < diskChunks.length - p && s < nextChunks.length - p &&
+         diskChunks[diskChunks.length - 1 - s] === nextChunks[nextChunks.length - 1 - s]) s += 1
+  return { from: p, keep: diskChunks.length - p - s, add: nextChunks.length - p - s, same: false }
 }
 
 /* ================================================================== *
@@ -311,7 +433,8 @@ export async function apply(ctx, config) {
     showReasoning: false,
     maxResultLines: 6,
     clean: true,
-    syncMs: 60000,          // 后台同步间隔；0 = 只在启动和每轮结束时同步
+    syncMs: 60000,          // 后台对账间隔；0 = 只在启动和每轮结束时对账
+    liveMs: 1000,           // 消息变动后多久落盘；0 = 只在每轮结束落盘
     skipSubagents: true,
   }, config || {})
 
@@ -327,11 +450,22 @@ export async function apply(ctx, config) {
   }
   const ARCHIVE_DIR = path.join(cfg.dir, String(cfg.archiveSubdir || DEFAULT_ARCHIVE))
 
-  /** id -> { recs: Map<seq|'h', record>, seen: number } */
+  /** id -> { recs: Map<seq|'h', record>, seen: number, live: boolean } */
   const store = new Map()
   /** id -> 上一次写出的文件路径（标题/目录变化时删旧文件用） */
   const currentFile = new Map()
-  const stats = { written: 0, moved: 0, errors: 0, lastPath: '', lastError: '', lastAt: '' }
+  /** id -> 上次对账时的签名（会话文件 + 归档集合 + 目标目录），没变就不干活 */
+  const sigOf = new Map()
+  /** 文档路径 -> { mtimeMs, size, parsed } */
+  const docCache = new Map()
+  /** 每会话在途标记 + 变动后的延迟落盘定时器 */
+  const inflight = new Set()
+  const timers = new Map()
+
+  const stats = {
+    written: 0, appended: 0, rewritten: 0, skipped: 0, moved: 0, errors: 0,
+    lastPath: '', lastError: '', lastAt: '',
+  }
   const loadedAt = new Date().toISOString()
 
   /* ---------- 落盘小工具 ---------- */
@@ -365,6 +499,27 @@ export async function apply(ctx, config) {
       if (fd !== undefined) { try { fs.closeSync(fd) } catch { /* 忽略 */ } }
     }
   }
+
+  /** 读磁盘文档并拆块；按 mtime+size 缓存，避免同一轮反复解析。 */
+  function readDoc(file) {
+    let st
+    try { st = fs.statSync(file) } catch { return null }
+    const hit = docCache.get(file)
+    if (hit && hit.mtimeMs === st.mtimeMs && hit.size === st.size) return hit.parsed
+    let parsed = null
+    try {
+      const text = fs.readFileSync(file, 'utf8')
+      parsed = splitDoc(text)
+    } catch {
+      parsed = null
+    }
+    if (docCache.size >= MAX_DOC_CACHE) docCache.clear()
+    docCache.set(file, { mtimeMs: st.mtimeMs, size: st.size, parsed })
+    return parsed
+  }
+
+  /** 缓存变了就丢，下次重读。 */
+  const dropDoc = (file) => docCache.delete(file)
 
   function listDocs() {
     const out = new Map()      // id -> [{ file, dir, mtimeMs }]，新的在前
@@ -488,7 +643,11 @@ export async function apply(ctx, config) {
     if (store.size <= MAX_SESSIONS) return
     const victims = [...store.entries()].filter(([id]) => id !== keepId)
       .sort((a, b) => (a[1].seen || 0) - (b[1].seen || 0))
-    while (store.size > MAX_SESSIONS && victims.length) store.delete(victims.shift()[0])
+    while (store.size > MAX_SESSIONS && victims.length) {
+      const [id] = victims.shift()
+      store.delete(id)
+      sigOf.delete(id)
+    }
   }
 
   const sorted = (e) => [...e.recs.values()].sort((a, b) => {
@@ -497,31 +656,68 @@ export async function apply(ctx, config) {
     return x - y
   })
 
-  /* ---------- 写一个会话 ---------- */
+  /* ---------- 写一个会话（对账式） ---------- */
   function exportSession(id, snap) {
+    if (!cfg.enabled) return null
+    const e = store.get(id)
+    if (!e || !e.recs.size) return null
     try {
-      if (!cfg.enabled) return null
-      const e = store.get(id)
-      if (!e || !e.recs.size) return null
       const records = sorted(e)
-      const text = render(id, records, cfg)
+      const { head, chunks } = renderDoc(id, records, cfg)
       const docs = listDocs()
-      const dir = dirFor(id, snap, docs.has(id) ? docs.get(id)[0].dir : null)
+      const mine = docs.get(id)
+      const dir = dirFor(id, snap, mine ? mine[0].dir : null)
       const target = uniquePath(dir, id, titleOf(records))
       fs.mkdirSync(dir, { recursive: true })
-      writeAtomic(target, text)
+
+      const disk = readDoc(target)
+      const headBytes = Buffer.byteLength(head)
+      const text = head + chunks.join('') + '\n'
+
+      if (!cfg.enabled) return null
+      if (!disk) {
+        writeAtomic(target, text)
+        stats.written += 1
+        stats.rewritten += 1
+      } else if (disk.prefix !== head) {
+        writeAtomic(target, text)                       // 头变了：整份重写
+        stats.written += 1
+        stats.rewritten += 1
+      } else {
+        const d = diffChunks(disk.chunks, chunks)
+        if (d.same) {
+          stats.skipped += 1
+        } else {
+          // 保留到分歧点之前，再追加剩下的块。只在原地改后半段，
+          // 正常追加时等于只写新块那几十字节。
+          let keep = headBytes
+          for (let i = 0; i < d.from; i += 1) keep += Buffer.byteLength(disk.chunks[i])
+          const tail = chunks.slice(d.from).join('') + '\n'
+          let fd
+          try {
+            fd = fs.openSync(target, 'r+')
+            fs.ftruncateSync(fd, keep)
+            fs.writeSync(fd, tail, keep, 'utf8')
+          } finally {
+            if (fd !== undefined) { try { fs.closeSync(fd) } catch { /* 忽略 */ } }
+          }
+          dropDoc(target)
+          stats.written += 1
+          if (d.from === 0) stats.rewritten += 1
+          else stats.appended += 1
+        }
+      }
 
       // 一个会话只留一份文档：标题变了、换了目录、或历史遗留的副本都删掉
-      const stale = [...(docs.get(id) || []).map(d => d.file)]
+      const stale = [...(mine || []).map(x => x.file)]
       const prev = currentFile.get(id)
       if (prev) stale.push(prev)
       for (const f of stale) {
         if (!f || path.resolve(f) === path.resolve(target)) continue
-        try { if (ownerOf(f) === id) fs.unlinkSync(f) } catch { /* 已经不在就算了 */ }
+        try { if (ownerOf(f) === id) { fs.unlinkSync(f); dropDoc(f) } } catch { /* 已经不在就算了 */ }
       }
       currentFile.set(id, target)
       snapCache = { at: 0, snap: null }
-      stats.written += 1
       stats.lastPath = target
       stats.lastAt = new Date().toISOString()
       stats.lastError = ''
@@ -530,11 +726,14 @@ export async function apply(ctx, config) {
       stats.errors += 1
       stats.lastError = String(err && err.message ? err.message : err)
       warn('导出失败 ' + stats.lastError)
+      // 原地改到一半失败时，磁盘上可能已经是半截文档：下轮用整份重写兜底
+      const f = currentFile.get(id)
+      if (f) dropDoc(f)
       return null
     }
   }
 
-  /* ---------- 对账：搬文件 + 补导出 ---------- */
+  /* ---------- 对账：搬文件 ---------- */
   function relocateAll(snap) {
     if (!snap.archKnown && !snap.filesKnown) return   // 两眼一抹黑，一个都不搬
     const docs = listDocs()
@@ -548,6 +747,7 @@ export async function apply(ctx, config) {
           if (fs.existsSync(dest)) {
             if (ownerOf(dest) !== id) continue      // 目标被别人的文件占着，留着不动
             fs.unlinkSync(dest)                     // 自己的旧副本，覆盖
+            dropDoc(dest)
           }
           try {
             fs.renameSync(doc.file, dest)
@@ -555,6 +755,7 @@ export async function apply(ctx, config) {
             fs.copyFileSync(doc.file, dest)
             if (ownerOf(doc.file) === id) fs.unlinkSync(doc.file)
           }
+          dropDoc(doc.file)
           if (currentFile.get(id) === doc.file) currentFile.set(id, dest)
           stats.moved += 1
         } catch (err) {
@@ -564,9 +765,11 @@ export async function apply(ctx, config) {
     }
   }
 
+  /* ---------- 对账：重新算一遍，只改不一致的地方 ---------- */
   let syncing = false
   async function syncAll(force) {
     if (syncing) return
+    if (!cfg.enabled) return
     syncing = true
     try {
       cleanupTmp()
@@ -574,10 +777,11 @@ export async function apply(ctx, config) {
       relocateAll(snap)
       const docs = listDocs()
       const files = snap.files || new Map()
-      // 会话文件比文档新（或还没文档）→ 补导出；分段让出事件循环，别卡住对话
+      const archKey = snap.archKnown ? [...snap.arch].sort().join(',') : '*'
       for (const [id, f] of files) {
         const doc = docs.get(id) && docs.get(id)[0]
-        if (doc && doc.mtimeMs >= f.mtimeMs) continue
+        const sig = f.mtimeMs + ':' + f.size + ':' + archKey
+        if (!force && doc && sigOf.get(id) === sig) continue      // 没变，连解压都省
         if (!store.has(id)) {
           const recs = readRecords(f.file)
           const head = recs.find(r => r.type === 'session')
@@ -588,6 +792,7 @@ export async function apply(ctx, config) {
           trimStore(id)
         }
         exportSession(id, snap)
+        sigOf.set(id, sig)
         // eslint-disable-next-line no-await-in-loop
         if (force) await new Promise(r => setImmediate(r))
       }
@@ -595,11 +800,18 @@ export async function apply(ctx, config) {
       warn('同步失败：' + String(err && err.message))
     } finally {
       syncing = false
-      writeState()
+      writeStateSoon()
     }
   }
 
   /* ---------- 状态文件 ---------- */
+  let stateTimer = null
+  function writeStateSoon() {
+    if (stateTimer) return
+    stateTimer = setTimeout(() => { stateTimer = null; writeState() }, 5000)
+    stateTimer.unref?.()
+  }
+
   function writeState() {
     try {
       fs.mkdirSync(cfg.dir, { recursive: true })
@@ -611,6 +823,9 @@ export async function apply(ctx, config) {
         updatedAt: new Date().toISOString(),
         enabled: cfg.enabled,
         written: stats.written,
+        appended: stats.appended,
+        rewritten: stats.rewritten,
+        unchanged: stats.skipped,
         moved: stats.moved,
         errors: stats.errors,
         lastPath: stats.lastPath,
@@ -621,6 +836,36 @@ export async function apply(ctx, config) {
       }
       writeAtomic(path.join(cfg.dir, STATE_FILE), JSON.stringify(body, null, 2) + '\n')
     } catch { /* 状态文件写不了不影响导出 */ }
+  }
+
+  /* ---------- 每会话的落盘调度 ---------- */
+  function runExport(id) {
+    if (inflight.has(id)) { schedule(id, 300); return }
+    inflight.add(id)
+    try {
+      exportSession(id, recentSnapshot())
+      writeStateSoon()
+    } catch (err) {
+      warn('事件处理失败 ' + String(err && err.message))
+    } finally {
+      inflight.delete(id)
+    }
+  }
+
+  function schedule(id, ms) {
+    const old = timers.get(id)
+    if (old) clearTimeout(old)
+    const wait = Number.isFinite(Number(ms)) ? Number(ms) : Number(cfg.liveMs)
+    if (!(wait > 0)) { timers.delete(id); return }
+    const t = setTimeout(() => { timers.delete(id); runExport(id) }, wait)
+    t.unref?.()
+    timers.set(id, t)
+  }
+
+  function flush(id) {
+    const t = timers.get(id)
+    if (t) { clearTimeout(t); timers.delete(id) }
+    runExport(id)
   }
 
   /* ---------- 钩子 ---------- */
@@ -641,17 +886,21 @@ export async function apply(ctx, config) {
       e.recs.set(event.seq === undefined ? 'h' : event.seq, event)
       e.seen = Date.now()
       trimStore(session.id)
+      if (!cfg.enabled) return
       if (event.type === 'turn/end') {
         // 归档/会话消失是不会发事件的，只能靠每轮结束顺手对一次账
-        const snap = recentSnapshot()
-        relocateAll(snap)
-        exportSession(session.id, snap)
-        writeState()
+        cachedSnapDrop()
+        relocateAll(recentSnapshot())
+        flush(session.id)
+      } else {
+        schedule(session.id)
       }
     } catch (err) {
       warn('事件处理失败 ' + String(err && err.message))
     }
   })
+
+  function cachedSnapDrop() { snapCache = { at: 0, snap: null } }
 
   // 启动：先搬文件（快），再异步补导出（慢，不阻塞）
   queueMicrotask(() => { syncAll(true).catch(() => {}) })
@@ -665,6 +914,15 @@ export async function apply(ctx, config) {
     }
     if (typeof ctx.effect === 'function') ctx.effect(startTimer, 'chatlog.sync')
     else startTimer()
+  }
+
+  if (typeof ctx.effect === 'function') {
+    ctx.effect(() => () => {
+      for (const t of timers.values()) clearTimeout(t)
+      timers.clear()
+      if (stateTimer) clearTimeout(stateTimer)
+      stateTimer = null
+    }, 'chatlog.dispose')
   }
 
   try { ctx.logger?.info?.('chatlog: 已加载 v' + VERSION + ' → ' + cfg.dir + '（归档 → ' + ARCHIVE_DIR + '）') } catch { /* 忽略 */ }
